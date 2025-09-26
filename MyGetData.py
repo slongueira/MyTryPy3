@@ -7,12 +7,11 @@ import pandas as pd
 import pyqtgraph as pg
 from datetime import datetime
 from ctypes import byref, c_int32
-from threading import Lock
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 from PyQt5.QtWidgets import (QApplication, QPushButton, QVBoxLayout, QWidget,
                              QLabel, QSpinBox, QHBoxLayout, QFileDialog, QInputDialog)
-from PyDAQmx.DAQmxConstants import (DAQmx_Val_RSE, DAQmx_Val_Diff, DAQmx_Val_Volts, 
+from PyDAQmx.DAQmxConstants import (DAQmx_Val_RSE, DAQmx_Val_Volts, 
                                     DAQmx_Val_Rising, DAQmx_Val_ContSamps, 
                                     DAQmx_Val_GroupByScanNumber, DAQmx_Val_Acquired_Into_Buffer, 
                                     DAQmx_Val_GroupByChannel, DAQmx_Val_ChanForAllLines)
@@ -24,23 +23,11 @@ from pyqtgraph.parametertree import Parameter, ParameterTree
 
 # ---------------- CONFIG ----------------
 
-SIGNALS = {
-    "LinMot_Enable": {
-        "channel": "Dev1/ai0",
-        "config": DAQmx_Val_RSE
-    },  
-    "Linmot_Up_Down": {
-        "channel": "Dev1/ai1",
-        "config": DAQmx_Val_RSE
-    },
-    "Voltage": {
-        "channel": "Dev1/ai2",
-        "config": DAQmx_Val_Diff
-    },
-    "Current": {
-        "channel": "Dev1/ai3",
-        "config": DAQmx_Val_RSE
-    }  
+CHANNELS = {
+    "LinMot_Enable": "Dev1/ai0",
+    "LinMot_Up_Down": "Dev1/ai1",
+    "Voltage": "Dev1/ai2",
+    "Current": "Dev1/ai3"
 }
 
 SAMPLE_RATE = 10000
@@ -73,9 +60,9 @@ class BufferProcessor(QObject):
             df = pd.DataFrame({
                 "Time (s)": t,
                 "Voltage": data[:, 2],
-                "Current": data[:, 3] / 499e3,
-                "LINMOT_ENABLE": np.where(data[:, 0] < 2, 0, 1),
-                "LINMOT_UP_DOWN": np.where(data[:, 1] < 2, 0, 1)
+                "Current": data[:, 3],
+                "LINMOT_ENABLE": data[:, 0],
+                "LINMOT_UP_DOWN": data[:, 1]
             })
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             df.to_pickle(f"{self.local_path}/DAQ_{timestamp}.pkl")
@@ -95,13 +82,9 @@ class DAQTask(Task):
         self.buffer2 = np.empty((BUFFER_SIZE, 4))
         self.current_buffer = self.buffer1
         self.index = 0
-
-        # Lock para proteger plot_buffer + write_index
-        self.plot_lock = Lock()
         
-        # Crear canales en el orden de inserción del dict (coincide con BufferProcessor: ai0, ai1, ai2, ai3)
-        for signal in list(SIGNALS.values()):
-            self.CreateAIVoltageChan(signal["channel"], "", signal["config"], -10.0, 10.0, DAQmx_Val_Volts, None)
+        for channel in list(CHANNELS.values()):
+            self.CreateAIVoltageChan(channel, "", DAQmx_Val_RSE, -10.0, 10.0, DAQmx_Val_Volts, None)
         
         self.CfgSampClkTiming("", SAMPLE_RATE, DAQmx_Val_Rising, DAQmx_Val_ContSamps, SAMPLES_PER_CALLBACK)
         self.AutoRegisterEveryNSamplesEvent(DAQmx_Val_Acquired_Into_Buffer, SAMPLES_PER_CALLBACK, 0)
@@ -113,18 +96,13 @@ class DAQTask(Task):
             read = c_int32()
             self.ReadAnalogF64(SAMPLES_PER_CALLBACK, 10.0, DAQmx_Val_GroupByScanNumber, data, data.size, byref(read), None)
             
-            # Obtener el canal seleccionado (p.ej. "Dev1/ai2") y derivar índice de columna (2)
-            selected_channel = self.data_column_selector.value()
-            col_idx = int(selected_channel.split('ai')[-1])
+            data[:, 0] = np.where(data[:, 0] < 2, 0, 1)
+            data[:, 1] = np.where(data[:, 1] < 2, 0, 1)
+            data[:, 3] /= 499e3 
             
-            # Escribir de forma atómica el trozo del plot buffer
-            with self.plot_lock:
-                start = self.write_index
-                end = start + SAMPLES_PER_CALLBACK
-                self.plot_buffer[start:end] = data[:, col_idx]
-                self.write_index = end % self.plot_buffer.size
+            self.plot_buffer[self.write_index:self.write_index + SAMPLES_PER_CALLBACK] = data[:, int(self.data_column_selector.value()[-1])]
+            self.write_index = (self.write_index + SAMPLES_PER_CALLBACK) % self.plot_buffer.size
             
-            # Copiar al buffer grande para guardado
             self.current_buffer[self.index:self.index + SAMPLES_PER_CALLBACK, :] = data
             self.index += SAMPLES_PER_CALLBACK
             
@@ -194,10 +172,7 @@ class MainWindow(QWidget):
         duration.addWidget(self.timer_spinbox)
         
         # Signal selector
-        SIGNAL_LIMITS = {k: v["channel"] for k, v in SIGNALS.items()}
-        self.param_group = Parameter.create(name='Select', type='list', 
-                                            value=SIGNAL_LIMITS["Voltage"], 
-                                            limits=SIGNAL_LIMITS)
+        self.param_group = Parameter.create(name='Signal', type='list', value=CHANNELS['Voltage'], limits=CHANNELS)
         self.tree = ParameterTree()
         self.tree.setParameters(self.param_group, showTop=True)
         self.layout.addWidget(self.tree)
@@ -253,13 +228,10 @@ class MainWindow(QWidget):
             self.toggle_linmot()
     
     def update_plot(self):
-        # Tomar snapshot consistente protegido por lock
-        with self.task.plot_lock:
-            idx = self.task.write_index
-            display_data = np.concatenate((
-                self.plot_buffer[idx:],
-                self.plot_buffer[:idx]
-            )).copy()
+        display_data = np.concatenate((
+            self.plot_buffer[self.task.write_index:],
+            self.plot_buffer[:self.task.write_index]
+        ))
         self.curve.setData(display_data)
     
     def closeEvent(self, event):
@@ -321,7 +293,6 @@ class MainWindow(QWidget):
                 if status_bit_0 == 0 and status_bit_1 == 0:
                     break
                 loop_counter += 1
-                time.sleep(0.001)  # <-- pequeña pausa para evitar busy-wait
 
             if loop_counter >= 10000:
                 print("\033[91mError loop counter overflow, raspberry is not responding\033[0m")
@@ -359,7 +330,6 @@ class MainWindow(QWidget):
 
                 if status_bit_0 == 0 and status_bit_1 == 0:
                     loop_counter += 1
-                    time.sleep(0.001)  # <-- pequeña pausa para evitar busy-wait
                 elif status_bit_0 == 1 and status_bit_1 == 0:
                     break
                 elif status_bit_0 == 0 and status_bit_1 == 1:
@@ -492,3 +462,5 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
+
+
